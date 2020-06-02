@@ -356,6 +356,87 @@ update_v2ray_config(){
 	fi
 }
 
+
+get_ss_node_info() {
+	decode_link=$(echo -n "$1" | sed 's/%/\\x/g' | xargs -0 printf '%b')
+	server=$(echo "$decode_link"|awk -F':' '{print $1}'|awk -F'@' '{print $2}')
+	server_port=$(echo "$decode_link"|awk -F':' '{print $2}'|awk -F'/' '{print $1}')
+	encrypt_method=$(echo "$decode_link"|awk -F'@' '{print $1}'|base64 -d |awk -F':' '{print $1}')
+	password=$(echo "$decode_link"|awk -F'@' '{print $1}'|base64 -d |awk -F':' '{print $2}')
+	password=`echo $password|base64_encode`
+	obfs=$(echo "$decode_link" | grep -Eo "obfs=.+"|awk -F';' '{print $1}'|awk -F'=' '{print $2}')
+	[-n "$obfs"] && obfs=''
+
+	obfs_host=$(echo "$decode_link" | grep -Eo "obfs-host=.+" | awk -F'&' '{print $1}' | awk -F'=' '{print $2}')
+	[-n "$obfs_host"] && obfs_host=''
+
+	remarks=$(echo "$decode_link" |awk -F'#' '{print $2}')
+	group_temp=$(echo "$decode_link" |grep -Eo "group=.+"|awk -F'#' '{print $1}'|awk -F'=' '{print $2}')
+	[ -n "$group_temp" ] && group=$(decode_url_link $group_temp) || group=""
+
+	[ -n "$group" ] && group_base64=`echo $group | base64_encode | sed 's/ -//g'`
+	[ -n "$server" ] && server_base64=`echo $server | base64_encode | sed 's/ -//g'`	
+	[ -n "$remarks" ] && remarks_base64=`echo $remarks | base64_encode | sed 's/ -//g'`	
+
+	[ -n "$group" ] && [ -n "$server" ] && echo $server_base64 $group_base64 $remarks_base64 >> /tmp/all_onlineservers
+	echo "$group" >> /tmp/all_group_info.txt
+}
+
+update_ss_nodes() {
+	local UPDATE_FLAG
+	local DELETE_FLAG
+
+	isadded_server=$(cat /tmp/all_localservers | grep $group_base64 | awk '{print $1}' | grep -c $server_base64|head -n1)
+	if [ "$isadded_server" == "0" ]; then
+		add_ss_nodes
+		let addnum+=1
+	else
+		index_line=$(cat /tmp/all_localservers| grep $group_base64 | grep $server_base64 |awk '{print $4}'|wc -l)
+		local index=$(cat /tmp/all_localservers| grep $group_base64 | grep $server_base64 |awk '{print $4}'|sed -n "$index_line p")
+
+		local_remarks=$(dbus get ssconf_basic_name_$index)
+		local_server_port=$(dbus get ssconf_basic_port_$index)
+		local_encrypt_method=$(dbus get ssconf_basic_method_$index)
+		local_password=$(dbus get ssconf_basic_password_$index)
+		local_obfs=$(dbus get ssconf_basic_ss_obfs_$index)
+		local_obfs_host=$(dbus get ssconf_basic_ss_obfs_host_$index)
+
+		local i=0
+		dbus set ssconf_basic_mode_$index="$ssr_subscribe_mode"
+		[ "$local_remarks" != "$remarks" ] && dbus set ssconf_basic_name_$index=$remarks && let i+=1
+		[ "$local_server_port" != "$server_port" ] && dbus set ssconf_basic_port_$index=$server_port && let i+=1
+		[ "$local_encrypt_method" != "$encrypt_method" ] && dbus set ssconf_basic_method_$index=$encrypt_method && let i+=1
+		[ "$local_obfs" != "$obfs" ] && dbus set ssconf_basic_ss_obfs_$index=$obfs && let i+=1
+		[ "$local_obfs_host" != "$obfs_host" ] && dbus set ssconf_basic_ss_obfs_host_$index=$obfs_host && let i+=1
+		[ "$local_password" != "$password" ] && dbus set ssconf_basic_password_$index=$password && let i+=1
+		if [ "$i" -gt "0" ];then
+			echo_date 修改SS节点：【$remarks】 && let updatenum+=1
+		else
+			echo_date SS节点：【$remarks】 参数未发生变化，跳过！
+		fi
+	fi
+	
+	echo $group >> /tmp/sub_group_info.txt
+}
+
+add_ss_nodes() {
+	usleep 100000
+	ssindex=$(($(dbus list ssconf_basic_|grep _name_ | cut -d "=" -f1|cut -d "_" -f4|sort -rn|head -n1)+1))
+	dbus set ssconf_basic_name_$ssindex=$remarks
+	[ -z "$1" ] && dbus set ssconf_basic_group_$ssindex=$group
+	dbus set ssconf_basic_mode_$ssindex=$ssr_subscribe_mode
+	dbus set ssconf_basic_server_$ssindex=$server
+	dbus set ssconf_basic_port_$ssindex=$server_port
+	dbus set ssconf_basic_method_$ssindex=$encrypt_method
+	dbus set ssconf_basic_type_$ssindex="0"
+	dbus set ssconf_basic_password_$ssindex=$password
+	dbus set ssconf_basic_ss_v2ray_$ssindex="0"
+	dbus set ssconf_basic_ss_v2ray_opts_$ssindex=""
+	dbus set ssconf_basic_ss_obfs_$ssindex=$obfs
+	dbus set ssconf_basic_ss_obfs_host_$ssindex=$obfs_host
+	echo_date SS节点：新增加【$remarks】到节点列表第 $ssindex 位。
+}
+
 get_ssr_node_info(){
 	decode_link="$1"
 	action="$2"
@@ -888,8 +969,33 @@ get_oneline_rule_now(){
 			echo_date "现共有订阅SSR/v2ray节点：$ONLINE_GET 个。"
 			echo_date "在线订阅列表更新完成!"			
 		elif [ -n "$NODE_FORMAT1" ];then
-			echo_date 暂时不支持ss节点订阅...
-			echo_date 退出订阅程序...
+			NODE_NU=`cat /tmp/ssr_subscribe_file_temp1.txt | grep -c "ss://"`
+			echo_date 检测到ss节点，共计$NODE_NU个节点...
+			urllinks=$(decode_url_link `cat /tmp/ssr_subscribe_file.txt` | sed 's/ss:\/\///g')
+			[ -z "$urllinks" ] && continue
+			for link in $urllinks
+			do
+				get_ss_node_info $link
+				update_ss_nodes
+			done
+			group=`cat /tmp/sub_group_info.txt|sort -u|sed 's/$/ + /g'|sed ':a;N;$!ba;s#\n##g'|sed 's/\s+\s$//g'`
+			if [ -n "$group" ];then
+				dbus set ss_online_group_$z=$group
+				echo $group >> /tmp/group_info.txt
+			else
+				# 如果最后一个节点是空的，那么使用这种方式去获取group名字
+				group=`cat /tmp/all_group_info.txt | sort -u | tail -n1`
+				[ -n "$group" ] && dbus set ss_online_group_$z=$group
+				[ -n "$group" ] && echo $group >> /tmp/group_info.txt
+			fi
+			del_none_exist
+			USER_ADD=$(($(dbus list ssconf_basic_|grep _name_|wc -l) - $(dbus list ssconf_basic_|grep _group_|wc -l))) || 0
+			ONLINE_GET=$(dbus list ssconf_basic_|grep _group_|wc -l) || 0
+			echo_date "本次更新订阅来源【$group】，共有节点$NODE_NU个，其中："
+			echo_date "因关键词排除节点$exclude个，新增节点 $addnum个，修改 $updatenum个，删除 $delnum个；"
+			echo_date "现共有自添加SS节点：$USER_ADD 个；"
+			echo_date "现共有订阅SS节点：$ONLINE_GET 个；"
+			echo_date "在线订阅列表更新完成!"
 		else
 			return 3
 		fi
@@ -931,8 +1037,8 @@ start_online_update(){
 		url=`dbus get ss_online_links|base64_decode|awk '{print $1}'|sed -n "$z p"|sed '/^#/d'`
 		[ -z "$url" ] && continue
 		echo_date "==================================================================="
-    	echo_date "                服务器订阅程序(Shell by stones & sadog)"
-    	echo_date "==================================================================="
+    echo_date "                服务器订阅程序(Shell by stones & sadog)"
+    echo_date "==================================================================="
 		echo_date "从 $url 获取订阅..."
 		addnum=0
 		updatenum=0
